@@ -15,7 +15,7 @@ used_names = set()
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 code_names = None
-with open(os.path.join(dir_path, 'names.txt')) as f:
+with open(os.path.join(dir_path, 'names.txt'), 'r', encoding='utf-8') as f:
     code_names = [i.strip() for i in f.readlines()]
 
 # happens in place
@@ -40,7 +40,8 @@ async def connect(sid, environ):
         if not static_code_names:
             # Reload in the list of usernames into a list that wont change
             # so that we can use them with suffixes.
-            with open(os.path.join(dir_path, 'names.txt')) as f:
+            with open(os.path.join(dir_path, 'names.txt'),
+                      'r', encoding='utf-8') as f:
                 static_code_names = [i.strip() for i in f.readlines()]
                 shuffle(static_code_names)
         count = 0
