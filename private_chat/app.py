@@ -1,109 +1,117 @@
-from flask import Flask, render_template, session, request
-from flask_socketio import SocketIO, emit, join_room, leave_room, \
-    close_room, rooms, disconnect
+from aiohttp import web
+from collections import defaultdict
+from random import choice
+from random import randint
+from random import shuffle
+import os
+import socketio
 
-# Set this variable to "threading", "eventlet" or "gevent" to test the
-# different async modes, or leave it set to None for the application to choose
-# the best option based on installed packages.
-async_mode = None
+sio = socketio.AsyncServer()
+app = web.Application()
+sio.attach(app)
+room_sids = defaultdict(set)
+sid_code_name_map = {}
+used_names = set()
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'
-socketio = SocketIO(app, async_mode=async_mode)
-thread = None
+dir_path = os.path.dirname(os.path.realpath(__file__))
+code_names = None
+with open(os.path.join(dir_path, 'names.txt')) as f:
+    code_names = [i.strip() for i in f.readlines()]
 
+# happens in place
+shuffle(code_names)
 
-def background_thread():
-    """Example of how to send server generated events to clients."""
-    count = 0
-    while True:
-        socketio.sleep(10)
-        count += 1
-        socketio.emit('my_response',
-                      {'data': 'Server generated event', 'count': count},
-                      namespace='/test')
+# Used for when we run out of usernames that are not suffixed by a number
+static_code_names = None
 
-
-@app.route('/')
-def index():
-    return render_template('index.html', async_mode=socketio.async_mode)
-
-
-@socketio.on('my_event', namespace='/test')
-def test_message(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': message['data'], 'count': session['receive_count']})
+async def index(request):
+    """Serve the client-side application."""
+    with open('static/index.html') as f:
+        return web.Response(text=f.read(), content_type='text/html')
 
 
-@socketio.on('my_broadcast_event', namespace='/test')
-def test_broadcast_message(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': message['data'], 'count': session['receive_count']},
-         broadcast=True)
+@sio.on('connect', namespace='/test')
+async def connect(sid, environ):
+    print("connect ", sid)
+    if code_names:
+        sid_code_name_map[sid] = code_names.pop()
+        used_names.add(sid_code_name_map[sid])
+    else:
+        if not static_code_names:
+            # Reload in the list of usernames into a list that wont change
+            # so that we can use them with suffixes.
+            with open(os.path.join(dir_path, 'names.txt')) as f:
+                static_code_names = [i.strip() for i in f.readlines()]
+                shuffle(static_code_names)
+        count = 0
+        while True:
+            try_name = ''.join([choice(static_code_names),
+                                str(randint(10))])
+            if try_name not in used_names:
+                sid_code_name_map[sid] = try_name
+                used_names.add(sid_code_name_map[sid])
+                break
+            count += 1
+            if count > 1000:
+                raise Exception('Too many users, can not generate username')
+    await sio.emit(
+        'system_message',
+        {'data': '&lt;{}&gt;Connected'\
+         .format(sid_code_name_map[sid])},
+        namespace='/test')
+    await sio.emit(
+        'system_message',
+        {'data': 'Your username is {}'.format(sid_code_name_map[sid])},
+        namespace='/test',
+        room=sid)
 
 
-@socketio.on('join', namespace='/test')
-def join(message):
-    join_room(message['room'])
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': 'In rooms: ' + ', '.join(rooms()),
-          'count': session['receive_count']})
+@sio.on('join_room', namespace='/test')
+async def join_room(sid, data):
+    room = data['room']
+    sio.enter_room(sid, room, '/test')
+    room_sids[room].add(sid)
+    print("{} entered room {}".format(sid, room))
+    await sio.emit(
+        'connections_response',
+        data={'data': 'New connection, total: {}'
+                      .format(len(room_sids[room]))},
+        namespace='/test')
 
 
-@socketio.on('leave', namespace='/test')
-def leave(message):
-    leave_room(message['room'])
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': 'In rooms: ' + ', '.join(rooms()),
-          'count': session['receive_count']})
+@sio.on('send_message', namespace='/test')
+async def message(sid, data):
+    username = sid_code_name_map[sid]
+    await sio.emit(
+        'my_response',
+        room=data['room'],
+        data={'data': data['data'], 'username': username},
+        namespace='/test')
 
 
-@socketio.on('close_room', namespace='/test')
-def close(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response', {'data': 'Room ' + message['room'] + ' is closing.',
-                         'count': session['receive_count']},
-         room=message['room'])
-    close_room(message['room'])
+@sio.on('disconnect', namespace='/test')
+async def disconnect(sid):
+    print('disconnect ', sid)
+    for room, sids in room_sids.items():
+        if sid in sids:
+            username = sid_code_name_map[sid]
+            sids.remove(sid)
+            # No, it is important to not re-use codenames, at least not in
+            # a short period of time. Re-using a code name in a short period
+            # of time could result in a person being confused for someone
+            # else.
+            # In time we will run out of code names, but the intention
+            # is that this service will run for a short period of time anyway.
+            # And lastly, the max users is probably 2 anyway.
+            # used_names.remove(sid_code_name_map[sid])
+            del sid_code_name_map[sid]
+            await sio.emit('system_message',
+                 # {'data': "Unique connections: {}".format(', '.join(room_sids[room]))},
+                 {'data': "&lt;{}&gt; disconnected, total left: {}".format(username, len(room_sids[room]))},
+                 room=room, namespace='/test')
 
-
-@socketio.on('my_room_event', namespace='/test')
-def send_room_message(message):
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': message['data'], 'count': session['receive_count']},
-         room=message['room'])
-
-
-@socketio.on('disconnect_request', namespace='/test')
-def disconnect_request():
-    session['receive_count'] = session.get('receive_count', 0) + 1
-    emit('my_response',
-         {'data': 'Disconnected!', 'count': session['receive_count']})
-    disconnect()
-
-
-@socketio.on('my_ping', namespace='/test')
-def ping_pong():
-    emit('my_pong')
-
-
-@socketio.on('connect', namespace='/test')
-def test_connect():
-    global thread
-    if thread is None:
-        thread = socketio.start_background_task(target=background_thread)
-    emit('my_response', {'data': 'Connected', 'count': 0})
-
-
-@socketio.on('disconnect', namespace='/test')
-def test_disconnect():
-    print('Client disconnected', request.sid)
-
+app.router.add_static('/static', 'static')
+app.router.add_get('/', index)
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    web.run_app(app, port=7632)
